@@ -1,0 +1,340 @@
+# Add this local package alongside the stock NabuCasa AUX-2 package.
+# Targets ESPHome 2026.11.0-dev. Grove LCD RGB Backlight V4/V5, 16 x 2.
+# Uses the existing i2c_grove bus; do not add another bus on GPIO1/GPIO2.
+# Metadata/progress are supplied by Sendspin, not arbitrary HTTP audio.
+
+i2c:
+  - id: !extend i2c_grove
+    frequency: 100kHz
+
+i2c_device:
+  - id: grove_lcd_text
+    i2c_id: i2c_grove
+    address: 0x3E
+  - id: grove_lcd_rgb
+    i2c_id: i2c_grove
+    address: 0x30  # Probed at runtime; falls back to V4's 0x62.
+
+globals:
+  - id: lcd_text_ready
+    type: bool
+    initial_value: 'false'
+  - id: lcd_rgb_ready
+    type: bool
+    initial_value: 'false'
+  - id: lcd_rgb_v5
+    type: bool
+    initial_value: 'true'
+  - id: lcd_red
+    type: uint8_t
+    initial_value: '255'
+  - id: lcd_green
+    type: uint8_t
+    initial_value: '255'
+  - id: lcd_blue
+    type: uint8_t
+    initial_value: '255'
+  - id: lcd_last_mode
+    type: int
+    initial_value: '-1'
+  - id: lcd_sendspin_paused
+    type: bool
+    initial_value: 'false'
+
+esphome:
+  min_version: 2026.11.0-dev
+  on_boot:
+    - priority: -100
+      then:
+        # Sendspin ends its audio stream on pause, so the speaker entity may
+        # report IDLE. Use the metadata playback speed for its pause indicator.
+        - lambda: |-
+            id(sendspin_hub).add_metadata_update_callback([](const auto &metadata) {
+              id(lcd_sendspin_paused) = metadata.progress.has_value() &&
+                  metadata.progress.value().playback_speed == 0;
+            });
+        - switch.turn_on: grove_power_switch
+        - delay: 100ms
+        - script.execute: lcd_initialize
+
+text_sensor:
+  - platform: sendspin
+    sendspin_id: sendspin_hub
+    id: lcd_title
+    type: title
+    internal: true
+  - platform: sendspin
+    sendspin_id: sendspin_hub
+    id: lcd_artist
+    type: artist
+    internal: true
+  - platform: template
+    id: lcd_status
+    name: "LCD Status"
+    icon: mdi:information-outline
+    update_interval: never
+
+sensor:
+  - platform: sendspin
+    sendspin_id: sendspin_hub
+    id: lcd_progress
+    type: track_progress
+    update_interval: 1s
+    internal: true
+  - platform: sendspin
+    sendspin_id: sendspin_hub
+    id: lcd_duration
+    type: track_duration
+    internal: true
+
+output:
+  - platform: template
+    id: lcd_red_output
+    type: float
+    write_action:
+      - lambda: 'id(lcd_red) = static_cast<uint8_t>(state * 255.0f + 0.5f);'
+  - platform: template
+    id: lcd_green_output
+    type: float
+    write_action:
+      - lambda: 'id(lcd_green) = static_cast<uint8_t>(state * 255.0f + 0.5f);'
+  - platform: template
+    id: lcd_blue_output
+    type: float
+    write_action:
+      - lambda: 'id(lcd_blue) = static_cast<uint8_t>(state * 255.0f + 0.5f);'
+
+light:
+  - platform: rgb
+    id: lcd_backlight
+    name: "LCD Backlight"
+    icon: mdi:television-ambient-light
+    red: lcd_red_output
+    green: lcd_green_output
+    blue: lcd_blue_output
+    gamma_correct: 1.0
+    default_transition_length: 0s
+    restore_mode: RESTORE_DEFAULT_ON
+
+switch:
+  - platform: template
+    id: lcd_auto_color
+    name: "LCD Automatic Color"
+    icon: mdi:palette
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    on_turn_on:
+      - lambda: 'id(lcd_last_mode) = -1;'
+
+script:
+  - id: lcd_initialize
+    mode: single
+    then:
+      - lambda: |-
+          if (!id(grove_power_switch).state) return;
+          id(lcd_text_ready) = false;
+          id(lcd_rgb_ready) = false;
+          id(lcd_last_mode) = -1;
+
+          // Check the text controller before issuing its startup sequence.
+          // Match Seeed's native I2C command protocol, not PCF8574 GPIO data.
+          if (id(grove_lcd_text).write(nullptr, 0) == i2c::ERROR_OK) {
+            bool ok = id(grove_lcd_text).write_byte(0x80, 0x28);
+            esphome::delay_microseconds_safe(4500);
+            ok = id(grove_lcd_text).write_byte(0x80, 0x28) && ok;
+            esphome::delay_microseconds_safe(150);
+            ok = id(grove_lcd_text).write_byte(0x80, 0x28) && ok;
+            ok = id(grove_lcd_text).write_byte(0x80, 0x0C) && ok;
+            ok = id(grove_lcd_text).write_byte(0x80, 0x01) && ok;
+            esphome::delay_microseconds_safe(2000);
+            ok = id(grove_lcd_text).write_byte(0x80, 0x06) && ok;
+            id(lcd_text_ready) = ok;
+          }
+
+          id(grove_lcd_rgb).set_i2c_address(0x30);
+          id(lcd_rgb_v5) =
+              id(grove_lcd_rgb).write(nullptr, 0) == i2c::ERROR_OK;
+          if (id(lcd_rgb_v5)) {
+            bool ok = id(grove_lcd_rgb).write_byte(0x00, 0x07);
+            esphome::delay_microseconds_safe(200);
+            ok = id(grove_lcd_rgb).write_byte(0x04, 0x15) && ok;
+            id(lcd_rgb_ready) = ok;
+          } else {
+            id(grove_lcd_rgb).set_i2c_address(0x62);
+            if (id(grove_lcd_rgb).write(nullptr, 0) == i2c::ERROR_OK) {
+              bool ok = id(grove_lcd_rgb).write_byte(0x00, 0x00);
+              // Individual PWM control of RGB channels on PCA9632.
+              ok = id(grove_lcd_rgb).write_byte(0x08, 0xAA) && ok;
+              ok = id(grove_lcd_rgb).write_byte(0x01, 0x00) && ok;
+              id(lcd_rgb_ready) = ok;
+            }
+          }
+          ESP_LOGI("grove_lcd", "Text: %s, RGB: %s (%s)",
+                   id(lcd_text_ready) ? "OK" : "missing/error",
+                   id(lcd_rgb_ready) ? "OK" : "missing/error",
+                   id(lcd_rgb_v5) ? "V5 / 0x30" : "V4 / 0x62");
+
+interval:
+  # Recover after Grove power is toggled or an I2C write fails.
+  - interval: 5s
+    then:
+      - if:
+          condition:
+            lambda: |-
+              return id(grove_power_switch).state &&
+                     (!id(lcd_text_ready) || !id(lcd_rgb_ready));
+          then:
+            - delay: 100ms
+            - script.execute: lcd_initialize
+
+  - interval: 500ms
+    then:
+      - lambda: |-
+          if (!id(grove_power_switch).state) {
+            id(lcd_text_ready) = false;
+            id(lcd_rgb_ready) = false;
+            if (id(lcd_status).state != "Grove power off")
+              id(lcd_status).publish_state("Grove power off");
+            return;
+          }
+
+          const bool network_ok = id(wifi_component).is_connected() ||
+                                  id(eth_component).is_connected();
+          const bool audio_error =
+              id(sendspin_source).get_state() == media_source::MediaSourceState::ERROR ||
+              id(media_http_source).get_state() == media_source::MediaSourceState::ERROR ||
+              id(announcement_http_source).get_state() == media_source::MediaSourceState::ERROR;
+          const bool device_error = (App.get_app_state() & STATUS_LED_ERROR) != 0;
+          const bool lcd_error = !id(lcd_text_ready) || !id(lcd_rgb_ready);
+          const auto player_state = id(external_media_player).state;
+          const auto http_state = id(media_http_source).get_state();
+          const bool http_active = http_state == media_source::MediaSourceState::PLAYING ||
+                                   http_state == media_source::MediaSourceState::PAUSED;
+          const bool playing = player_state == media_player::MEDIA_PLAYER_STATE_PLAYING;
+          const bool announcing = player_state == media_player::MEDIA_PLAYER_STATE_ANNOUNCING;
+          const bool paused = player_state == media_player::MEDIA_PLAYER_STATE_PAUSED ||
+              (!playing && !announcing && !http_active && id(lcd_sendspin_paused));
+
+          // Red has priority over playback when automatic color is enabled.
+          int mode = 0;  // Idle: white.
+          const char *label = "STOP";
+          std::string status = "Idle";
+          if (!network_ok) {
+            mode = 3; label = "NET!"; status = "Network disconnected";
+          } else if (audio_error || device_error || lcd_error) {
+            mode = 3; label = "ERR!";
+            status = lcd_error ? "LCD communication error" :
+                     audio_error ? "Audio source error" : "Device error";
+          } else if (announcing) {
+            mode = 2; label = "TTS "; status = "Announcement";
+          } else if (playing) {
+            mode = 1; label = "PLAY"; status = "Playing";
+          } else if (paused) {
+            mode = 2; label = "PAUS"; status = "Paused";
+          }
+          if (id(lcd_status).state != status) id(lcd_status).publish_state(status);
+
+          if (id(lcd_auto_color).state && mode != id(lcd_last_mode)) {
+            id(lcd_last_mode) = mode;
+            auto call = id(lcd_backlight).turn_on();
+            call.set_transition_length(0);
+            call.set_brightness(0.6f);
+            if (mode == 3) call.set_rgb(1.0f, 0.0f, 0.0f);
+            else if (mode == 1) call.set_rgb(0.0f, 0.0f, 1.0f);
+            else if (mode == 2) call.set_rgb(1.0f, 0.45f, 0.0f);
+            else call.set_rgb(1.0f, 1.0f, 1.0f);
+            call.perform();
+          }
+
+          // Output values come from the RGB light, so HA sees and controls it.
+          // Repeat three short writes so reinitialization restores the color.
+          if (id(lcd_rgb_ready)) {
+            const uint8_t r_reg = id(lcd_rgb_v5) ? 0x06 : 0x04;
+            const uint8_t g_reg = id(lcd_rgb_v5) ? 0x07 : 0x03;
+            const uint8_t b_reg = id(lcd_rgb_v5) ? 0x08 : 0x02;
+            bool ok = id(grove_lcd_rgb).write_byte(r_reg, id(lcd_red));
+            ok = id(grove_lcd_rgb).write_byte(g_reg, id(lcd_green)) && ok;
+            ok = id(grove_lcd_rgb).write_byte(b_reg, id(lcd_blue)) && ok;
+            id(lcd_rgb_ready) = ok;
+          }
+          if (!id(lcd_text_ready)) return;
+
+          const auto source_state = id(sendspin_source).get_state();
+          const bool show_metadata = !announcing && (playing || paused) &&
+              (source_state == media_source::MediaSourceState::PLAYING ||
+               source_state == media_source::MediaSourceState::PAUSED ||
+               (!http_active && id(lcd_sendspin_paused)));
+
+          auto format_time = [](float ms, char *out) {
+            if (!std::isfinite(ms) || ms < 0) {
+              snprintf(out, 6, "--:--");
+              return;
+            }
+            uint32_t seconds = static_cast<uint32_t>(ms / 1000.0f);
+            if (seconds < 6000) {
+              snprintf(out, 6, "%02u:%02u", unsigned(seconds / 60), unsigned(seconds % 60));
+            } else {
+              uint32_t minutes = std::min<uint32_t>(seconds / 60, 5999);
+              snprintf(out, 6, "%02uh%02u", unsigned(minutes / 60), unsigned(minutes % 60));
+            }
+          };
+          char elapsed[6], duration[6], top[17];
+          format_time(show_metadata ? id(lcd_progress).state : NAN, elapsed);
+          format_time(show_metadata ? id(lcd_duration).state : NAN, duration);
+          snprintf(top, sizeof(top), "%.4s %s/%s", label, elapsed, duration);
+
+          std::string message;
+          if (mode == 3) message = status;
+          else if (announcing) message = "Announcement";
+          else if (show_metadata) {
+            message = id(lcd_title).state;
+            if (!id(lcd_artist).state.empty()) {
+              if (!message.empty()) message += " - ";
+              message += id(lcd_artist).state;
+            }
+            if (message.empty()) message = "No track metadata";
+          } else if (playing || paused) message = "HTTP audio";
+          else message = "Ready to play";
+
+          // This character LCD cannot render arbitrary Unicode. Replace each
+          // unsupported UTF-8 code point once, preserving column/scroll width.
+          std::string ascii;
+          for (unsigned char c : message) {
+            if (c >= 32 && c <= 126) ascii += char(c);
+            else if ((c & 0xC0) != 0x80) ascii += '?';
+          }
+
+          static std::string previous;
+          static size_t offset = 0;
+          static uint32_t next_scroll = 0;
+          const uint32_t now = millis();
+          if (ascii != previous) {
+            previous = ascii;
+            offset = 0;
+            next_scroll = now + 2000;
+          }
+          if (ascii.size() > 16 && int32_t(now - next_scroll) >= 0) {
+            if (offset >= ascii.size() - 16) {
+              offset = 0;
+              next_scroll = now + 2000;
+            } else {
+              ++offset;
+              next_scroll = now + (offset == ascii.size() - 16 ? 2000 : 500);
+            }
+          }
+          std::string bottom = ascii.substr(offset, 16);
+          bottom.resize(16, ' ');
+
+          // Rewrite whole rows, padded to 16 cells, without clear() flicker.
+          // Individual character writes preserve the LCD instruction timing.
+          auto write_row = [](uint8_t address, const char *text) {
+            bool ok = id(grove_lcd_text).write_byte(0x80, address);
+            for (size_t i = 0; i < 16 && ok; ++i) {
+              ok = id(grove_lcd_text).write_byte(0x40, uint8_t(text[i]));
+              esphome::delay_microseconds_safe(50);
+            }
+            return ok;
+          };
+          bool ok = write_row(0x80, top);
+          ok = write_row(0xC0, bottom.c_str()) && ok;
+          id(lcd_text_ready) = ok;
